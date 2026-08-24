@@ -123,25 +123,51 @@ def export_to_excel(session, primary_coords, output_dir, filename):
             pass
 
     if not exported:
-        # Modo 2: ALV Grid via cntlGRID1 (GuiCustomControl)
-        for grid_path in [
-            "wnd[0]/usr/cntlGRID1/shellcont/shell",
-            "wnd[0]/usr/cntlGRID1",
-            "wnd[0]/usr/cntlALV_CONTAINER_1/shellcont/shell",
-            "wnd[0]/usr/cntlALV_CONTAINER_1",
-        ]:
-            try:
-                ctrl = session.findById(grid_path)
-                ctrl.pressToolbarButton("&MB_EXPORT")
+        # Modo 2: ALV Grid — navegar hasta el GuiShell dentro del GuiSplitterShell
+        try:
+            splitter = session.findById("wnd[0]/usr/cntlGRID1/shellcont/shell")
+            print(f"  Splitter encontrado ({splitter.Type}), hijos: {splitter.Children.Count}")
+            for i in range(splitter.Children.Count):
+                pane = splitter.Children(i)
+                print(f"    pane[{i}] Id={pane.Id}  Type={pane.Type}")
+                for btn_id in ["&MB_EXPORT", "%EXPORT", "&EXPORT"]:
+                    try:
+                        pane.pressToolbarButton(btn_id)
+                        try:
+                            session.findById("wnd[1]/tbar[0]/btn[20]").press()
+                        except Exception:
+                            pass
+                        exported = True
+                        print(f"  Export via pane[{i}] btn={btn_id}")
+                        break
+                    except Exception:
+                        pass
+                if exported:
+                    break
                 try:
-                    session.findById("wnd[1]/tbar[0]/btn[20]").press()
+                    for j in range(pane.Children.Count):
+                        inner = pane.Children(j)
+                        print(f"      inner[{i}.{j}] Id={inner.Id}  Type={inner.Type}")
+                        for btn_id in ["&MB_EXPORT", "%EXPORT", "&EXPORT"]:
+                            try:
+                                inner.pressToolbarButton(btn_id)
+                                try:
+                                    session.findById("wnd[1]/tbar[0]/btn[20]").press()
+                                except Exception:
+                                    pass
+                                exported = True
+                                print(f"  Export via inner[{i}.{j}] btn={btn_id}")
+                                break
+                            except Exception:
+                                pass
+                        if exported:
+                            break
                 except Exception:
                     pass
-                exported = True
-                print(f"  Export modo ALV grid ({grid_path})")
-                break
-            except Exception:
-                pass
+                if exported:
+                    break
+        except Exception as e:
+            print(f"  Error accediendo splitter: {e}")
 
     if not exported:
         # Modo 3: navegar hijos de cntlGRID1 para encontrar el shell
