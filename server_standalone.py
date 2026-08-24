@@ -144,6 +144,54 @@ def export_to_excel(session, primary_coords, output_dir, filename):
                 pass
 
     if not exported:
+        # Modo 3: navegar hijos de cntlGRID1 para encontrar el shell
+        try:
+            ctrl = session.findById("wnd[0]/usr/cntlGRID1")
+            print(f"  cntlGRID1 hijos: {ctrl.Children.Count}")
+            for i in range(ctrl.Children.Count):
+                child = ctrl.Children(i)
+                print(f"    [{i}] Id={child.Id}  Type={child.Type}")
+                for btn_id in ["&MB_EXPORT", "%EXPORT", "&EXPORT"]:
+                    try:
+                        child.pressToolbarButton(btn_id)
+                        try:
+                            session.findById("wnd[1]/tbar[0]/btn[20]").press()
+                        except Exception:
+                            pass
+                        exported = True
+                        print(f"  Export via Children({i}) btn={btn_id}")
+                        break
+                    except Exception:
+                        pass
+                if exported:
+                    break
+                # Intentar nietos
+                try:
+                    for j in range(child.Children.Count):
+                        grandchild = child.Children(j)
+                        print(f"      [{i}.{j}] Id={grandchild.Id}  Type={grandchild.Type}")
+                        for btn_id in ["&MB_EXPORT", "%EXPORT", "&EXPORT"]:
+                            try:
+                                grandchild.pressToolbarButton(btn_id)
+                                try:
+                                    session.findById("wnd[1]/tbar[0]/btn[20]").press()
+                                except Exception:
+                                    pass
+                                exported = True
+                                print(f"  Export via Children({i}).Children({j}) btn={btn_id}")
+                                break
+                            except Exception:
+                                pass
+                        if exported:
+                            break
+                except Exception:
+                    pass
+                if exported:
+                    break
+        except Exception as e:
+            print(f"  Error explorando cntlGRID1: {e}")
+
+    if not exported:
         print("  DIAGNOSTICO — elementos en wnd[0]/usr:")
         try:
             usr = session.findById("wnd[0]/usr")
