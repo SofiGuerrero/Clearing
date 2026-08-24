@@ -143,9 +143,17 @@ def export_to_excel(session, primary_coords, output_dir, filename):
                 pass
 
     if not exported:
+        # Diagnóstico: listar los elementos disponibles en wnd[0]/usr
+        print("  DIAGNOSTICO — elementos en wnd[0]/usr:")
+        try:
+            usr = session.findById("wnd[0]/usr")
+            for i in range(usr.Children.Count):
+                child = usr.Children(i)
+                print(f"    [{i}] Id={child.Id}  Type={child.Type}")
+        except Exception as e:
+            print(f"    No se pudo listar: {e}")
         raise RuntimeError(
-            "No se pudo iniciar el export. Verificar que FAGLL03 muestre resultados "
-            "y que no haya popups abiertos en SAP GUI."
+            "No se pudo iniciar el export. Ver diagnóstico arriba para identificar el path correcto."
         )
 
     session.findById("wnd[1]/usr/ctxtDY_PATH").text = output_dir
