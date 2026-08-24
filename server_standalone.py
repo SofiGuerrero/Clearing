@@ -123,27 +123,27 @@ def export_to_excel(session, primary_coords, output_dir, filename):
             pass
 
     if not exported:
-        # Modo 2: ALV Grid — buscar el shell container
-        for shell_path in [
+        # Modo 2: ALV Grid via cntlGRID1 (GuiCustomControl)
+        for grid_path in [
             "wnd[0]/usr/cntlGRID1/shellcont/shell",
+            "wnd[0]/usr/cntlGRID1",
             "wnd[0]/usr/cntlALV_CONTAINER_1/shellcont/shell",
-            "wnd[0]/usr/subSUBSCREEN:SAPLKKBL:0600/cntlGRID1/shellcont/shell",
+            "wnd[0]/usr/cntlALV_CONTAINER_1",
         ]:
             try:
-                shell = session.findById(shell_path)
-                shell.pressToolbarButton("&MB_EXPORT")
+                ctrl = session.findById(grid_path)
+                ctrl.pressToolbarButton("&MB_EXPORT")
                 try:
                     session.findById("wnd[1]/tbar[0]/btn[20]").press()
                 except Exception:
                     pass
                 exported = True
-                print(f"  Export modo ALV grid ({shell_path})")
+                print(f"  Export modo ALV grid ({grid_path})")
                 break
             except Exception:
                 pass
 
     if not exported:
-        # Diagnóstico: listar los elementos disponibles en wnd[0]/usr
         print("  DIAGNOSTICO — elementos en wnd[0]/usr:")
         try:
             usr = session.findById("wnd[0]/usr")
@@ -169,13 +169,16 @@ US_OUTPUT = os.path.join(OUTPUT_DIR, "Clearing US Pivot.xlsx")
 def download_us():
     s_last_day = get_last_day_of_month()
     session = get_sap_session("ISP")
+    print("  Conexion ISP OK")
     session.findById("wnd[0]").maximize()
     session.findById("wnd[0]/tbar[0]/okcd").text = "FAGLL03"
     session.findById("wnd[0]").sendVKey(0)
+    print("  FAGLL03 abierto")
     session.findById("wnd[0]/tbar[1]/btn[17]").press()
     session.findById("wnd[1]/usr/txtV-LOW").text = "/GL ACC SA"
     session.findById("wnd[1]/usr/txtENAME-LOW").text = ""
     session.findById("wnd[1]/tbar[0]/btn[8]").press()
+    print("  Variante seleccionada")
     session.findById("wnd[0]/usr/ctxtPA_STIDA").setFocus()
     session.findById("wnd[0]/usr/ctxtPA_STIDA").caretPosition = 7
     session.findById("wnd[0]").sendVKey(4)
@@ -184,6 +187,7 @@ def download_us():
     shell.firstVisibleDate = s_last_day
     shell.selectionInterval = f"{s_last_day},{s_last_day}"
     session.findById("wnd[0]/tbar[1]/btn[8]").press()
+    print("  Reporte ejecutado")
     export_to_excel(session, "17,14", OUTPUT_DIR, "Clearing US Input.xlsx")
     print(f"Reporte US descargado. Fecha clave: {s_last_day}")
 
