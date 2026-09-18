@@ -73,8 +73,8 @@ def download_report():
 
     session.findById("wnd[0]/tbar[1]/btn[8]").press()
 
-    session.findById("wnd[0]/usr/lbl[17,14]").setFocus()
-    session.findById("wnd[0]/usr/lbl[17,14]").caretPosition = 0
+    session.findById("wnd[0]/usr/lbl[2,8]").setFocus()
+    session.findById("wnd[0]/usr/lbl[2,8]").caretPosition = 0
     session.findById("wnd[0]").sendVKey(16)
     session.findById("wnd[1]/tbar[0]/btn[20]").press()
 
