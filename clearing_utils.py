@@ -56,8 +56,8 @@ def write_docs_sheet(wb, df_filtered, pivot):
     """Hoja con los document numbers de las combinaciones con balance = 0."""
     ws = wb.create_sheet("Docs a Clearear")
 
-    headers    = ["G/L Account", "Company Code", "Document Number", "Amount in LC", "Text", "Assignment"]
-    col_widths = [15, 16, 20, 18, 45, 25]
+    headers    = ["G/L Account", "Company Code", "Document Number", "Year/Month", "Amount in LC", "Text", "Assignment"]
+    col_widths = [15, 16, 20, 14, 18, 45, 25]
     _write_header(ws, headers, col_widths)
 
     # Solo combinaciones con balance 0
@@ -79,6 +79,7 @@ def write_docs_sheet(wb, df_filtered, pivot):
             row["Account"],
             row["Company Code"],
             row["Document Number"],
+            row.get("Year/Month", ""),
             row["Amount in Local Currency"],
             row.get("Text", ""),
             row.get("Assignment", ""),
@@ -88,9 +89,9 @@ def write_docs_sheet(wb, df_filtered, pivot):
             cell.fill      = GREEN
             cell.font      = data_font
             cell.border    = border
-            cell.alignment = center if col_idx != 5 else left
+            cell.alignment = center if col_idx not in (6,) else left
 
-        ws.cell(row=excel_row, column=4).number_format = '#,##0.00'
+        ws.cell(row=excel_row, column=5).number_format = '#,##0.00'
         excel_row += 1
 
 
