@@ -624,10 +624,13 @@ HTML = """<!DOCTYPE html>
   <div id="analytics-section" class="analytics-section" style="display:none;">
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;">
       <div class="section-label" style="margin:0;">Analytics</div>
-      <div class="flow-tabs">
-        <button class="flow-tab" id="atab-us"     onclick="switchAnalytics('us',this)">🇺🇸 US</button>
-        <button class="flow-tab" id="atab-canada" onclick="switchAnalytics('canada',this)">🇨🇦 Canada</button>
-        <button class="flow-tab" id="atab-concur" onclick="switchAnalytics('concur',this)">📋 Concur</button>
+      <div style="display:flex;align-items:center;gap:8px;">
+        <div class="flow-tabs">
+          <button class="flow-tab" id="atab-us"     onclick="switchAnalytics('us',this)">🇺🇸 US</button>
+          <button class="flow-tab" id="atab-canada" onclick="switchAnalytics('canada',this)">🇨🇦 Canada</button>
+          <button class="flow-tab" id="atab-concur" onclick="switchAnalytics('concur',this)">📋 Concur</button>
+        </div>
+        <a class="btn-ghost" href="/download-history" style="font-size:.78rem;">⬇ Clearing History</a>
       </div>
     </div>
 
@@ -1474,6 +1477,42 @@ def download_open_items(key):
     except Exception as e:
         import traceback
         return jsonify({"error": str(e), "detail": traceback.format_exc()}), 500
+
+
+@app.route("/download-history")
+def download_history():
+    import glob, re as _re
+    pattern = os.path.join(SCRIPT_DIR, "Clearing_Results_*.xlsx")
+    files = sorted(f for f in glob.glob(pattern) if "CONSOLIDATED" not in os.path.basename(f).upper())
+    if not files:
+        return "No clearing results found. Run a clearing first.", 404
+    frames = []
+    for f in files:
+        name = os.path.basename(f)
+        m = _re.match(r"Clearing_Results_([A-Z]+)_(\d{8})_(\d{6})\.xlsx", name)
+        system = m.group(1) if m else "UNKNOWN"
+        ts_str = (m.group(2) + "_" + m.group(3)) if m else ""
+        try:
+            ts = datetime.strptime(ts_str, "%Y%m%d_%H%M%S").strftime("%Y-%m-%d %H:%M:%S") if ts_str else ""
+        except Exception:
+            ts = ts_str
+        try:
+            df = pd.read_excel(f, sheet_name="Clearing Results")
+            df.insert(0, "System", system)
+            df.insert(1, "Run Timestamp", ts)
+            frames.append(df)
+        except Exception:
+            pass
+    if not frames:
+        return "No data found in result files.", 404
+    combined = pd.concat(frames, ignore_index=True)
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        combined.to_excel(writer, index=False, sheet_name="All Results")
+    buf.seek(0)
+    filename = f"Clearing_History_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    return send_file(buf, as_attachment=True, download_name=filename,
+                     mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 
 if __name__ == "__main__":
