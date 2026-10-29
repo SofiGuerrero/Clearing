@@ -5,10 +5,17 @@ Requiere: pip install flask
 
 import os
 import sys
+import re
+import io
+import time
+import queue
 import shutil
 import tempfile
+import threading
 import subprocess
-from flask import Flask, Response, render_template_string, jsonify
+import openpyxl
+from datetime import datetime
+from flask import Flask, Response, render_template_string, jsonify, request, send_file
 import pandas as pd
 
 app = Flask(__name__)
@@ -35,6 +42,376 @@ INPUT_FILES = {
     "canada": "Clearing Canada Input.xlsx",
     "concur": "Clearing Concur Input.xlsx",
 }
+
+_clearing_results = {}    # key → [{account, cc, clearing_doc, status, error}]
+_clear_tasks = {}         # task_id → {"key": ..., "q": Queue}
+_clear_pause_events = {}  # task_id → threading.Event (waiting for manual SAP action)
+
+
+def do_clear_account(session, gl_account, company_code, doc_numbers, clearing_date, system="ISP"):
+    """Execute SAP F-03 clearing. Returns (clearing_doc_number, error_message).
+    system='ISP' (US/Canada) uses radio[3,0] and wnd[1] for the doc number.
+    system='I4P' (Concur) uses radio[2,0] and reads the doc number from the status bar.
+    NOTE: radio button indices may differ per SAP GUI template -- adjust if needed.
+    """
+    try:
+        session.findById("wnd[0]").maximize()
+        session.findById("wnd[0]/tbar[0]/okcd").text = "/nf-03"
+        session.findById("wnd[0]").sendVKey(0)
+        time.sleep(0.5)
+
+        for date_path in ("wnd[0]/usr/ctxtRF05A-AUGDT", "wnd[0]/usr/ctxtBKPF-BUDAT"):
+            try:
+                session.findById(date_path).text = clearing_date
+                break
+            except Exception:
+                pass
+
+        radio_idx = 2 if system == "I4P" else 3
+        radio_path = f"wnd[0]/usr/sub:SAPMF05A:0131/radRF05A-XPOS1[{radio_idx},0]"
+
+        session.findById(radio_path).select()
+        session.findById("wnd[0]/usr/ctxtRF05A-AGKON").text = str(gl_account)
+        try:
+            session.findById("wnd[0]/usr/ctxtBKPF-BUKRS").text = str(company_code).zfill(4)
+        except Exception:
+            pass
+        session.findById(radio_path).setFocus()
+        session.findById("wnd[0]").sendVKey(0)
+        time.sleep(0.5)
+
+        try:
+            sbar = session.findById("wnd[0]/sbar").Text or ""
+            if "future" in sbar.lower():
+                session.findById("wnd[0]").sendVKey(0)
+                time.sleep(0.5)
+        except Exception:
+            pass
+
+        unique_docs = list(dict.fromkeys(str(d) for d in doc_numbers))
+        chunks = [unique_docs[i:i + 19] for i in range(0, len(unique_docs), 19)]
+
+        for chunk_idx, chunk in enumerate(chunks):
+            is_last = (chunk_idx == len(chunks) - 1)
+            for i, doc in enumerate(chunk):
+                try:
+                    session.findById(f"wnd[0]/usr/sub:SAPMF05A:0731/txtRF05A-SEL01[{i},0]").text = doc
+                except Exception:
+                    break
+            session.findById("wnd[0]/tbar[1]/btn[16]").press()
+            time.sleep(0.5)
+            if not is_last:
+                session.findById("wnd[0]/tbar[1]/btn[7]").press()
+                time.sleep(0.3)
+                session.findById("wnd[0]/tbar[1]/btn[6]").press()
+                time.sleep(0.3)
+                cont_radio = f"wnd[0]/usr/sub:SAPMF05A:0710/radRF05A-XPOS1[{radio_idx},0]"
+                session.findById(cont_radio).select()
+                session.findById(cont_radio).setFocus()
+                session.findById("wnd[0]").sendVKey(0)
+                time.sleep(0.5)
+
+        try:
+            sbar = session.findById("wnd[0]/sbar").Text
+            if sbar and any(w in sbar.lower() for w in ("error", "not possible", "cannot")):
+                return None, sbar
+        except Exception:
+            pass
+
+        session.findById("wnd[0]/tbar[0]/btn[11]").press()
+        time.sleep(1.0)
+
+        if system == "I4P":
+            doc_num = None
+            sbar_text = ""
+            try:
+                sbar_text = session.findById("wnd[0]/sbar").Text or ""
+                m = re.search(r"\b(\d{8,10})\b", sbar_text)
+                if m:
+                    doc_num = m.group(1)
+            except Exception:
+                pass
+            try:
+                session.findById("wnd[0]/sbar").doubleClick()
+                time.sleep(0.5)
+                if not doc_num:
+                    for sp in ("wnd[0]/shellcont/shell", "wnd[0]/shellcont"):
+                        try:
+                            t = session.findById(sp).Text or ""
+                            m2 = re.search(r"\b(\d{8,10})\b", t)
+                            if m2:
+                                doc_num = m2.group(1)
+                                break
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            try:
+                session.findById("wnd[0]/shellcont").close()
+                time.sleep(0.5)
+            except Exception:
+                pass
+            if doc_num:
+                return doc_num, None
+            return None, f"__PAUSE_NEEDED__:{sbar_text or 'I4P: no SAP response after posting'}"
+
+        doc_num = None
+        debug_texts = []
+        wnd1_found = False
+        try:
+            wnd1 = session.findById("wnd[1]")
+            wnd1_found = True
+            title = wnd1.Text or ""
+            if title:
+                debug_texts.append(f"title:{title}")
+            try:
+                usr = session.findById("wnd[1]/usr")
+                for i in range(min(usr.Children.Count, 30)):
+                    try:
+                        child = usr.Children(i)
+                        t = getattr(child, "Text", "") or ""
+                        if t:
+                            debug_texts.append(t)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            full_text = " ".join([title] + debug_texts)
+            m = re.search(r"\b(\d{8,10})\b", full_text)
+            if m:
+                doc_num = m.group(1)
+        except Exception:
+            pass
+
+        if wnd1_found:
+            try:
+                session.findById("wnd[1]/tbar[0]/btn[0]").press()
+                time.sleep(1.0)
+            except Exception:
+                time.sleep(0.5)
+
+        if doc_num:
+            return doc_num, None
+
+        if not wnd1_found:
+            sbar = ""
+            for _ in range(2):
+                try:
+                    sbar = session.findById("wnd[0]/sbar").Text or ""
+                    if sbar:
+                        break
+                except Exception:
+                    pass
+                time.sleep(0.5)
+            return None, f"__PAUSE_NEEDED__:{sbar or 'SAP rejected posting (balance != 0)'}"
+
+        sbar = ""
+        for _ in range(3):
+            try:
+                sbar = session.findById("wnd[0]/sbar").Text or ""
+                if sbar:
+                    break
+            except Exception:
+                pass
+            time.sleep(0.8)
+        m = re.search(r"\b(\d{8,10})\b", sbar)
+        if m:
+            return m.group(1), None
+
+        debug = " | ".join(debug_texts) or "empty window"
+        return None, f"Posted but doc number not captured. wnd[1]: {debug} | sbar: '{sbar}'"
+
+    except Exception as exc:
+        return None, str(exc)
+
+
+def _retry_post(session, system="ISP"):
+    """Retry F-03 post in Process Open Items screen after manual correction."""
+    try:
+        session.findById("wnd[0]/tbar[0]/btn[11]").press()
+        time.sleep(1.0)
+
+        if system == "I4P":
+            doc_num = None
+            sbar_text = ""
+            try:
+                sbar_text = session.findById("wnd[0]/sbar").Text or ""
+                m = re.search(r"\b(\d{8,10})\b", sbar_text)
+                if m:
+                    doc_num = m.group(1)
+            except Exception:
+                pass
+            try:
+                session.findById("wnd[0]/sbar").doubleClick()
+                time.sleep(0.5)
+                if not doc_num:
+                    for sp in ("wnd[0]/shellcont/shell", "wnd[0]/shellcont"):
+                        try:
+                            t = session.findById(sp).Text or ""
+                            m2 = re.search(r"\b(\d{8,10})\b", t)
+                            if m2:
+                                doc_num = m2.group(1)
+                                break
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            try:
+                session.findById("wnd[0]/shellcont").close()
+                time.sleep(0.5)
+            except Exception:
+                pass
+            if doc_num:
+                return doc_num, None
+            return None, f"Retry I4P: {sbar_text or 'no SAP response'}"
+
+        doc_num = None
+        debug_texts = []
+        try:
+            wnd1 = session.findById("wnd[1]")
+            title = wnd1.Text or ""
+            if title:
+                debug_texts.append(f"title:{title}")
+            try:
+                usr = session.findById("wnd[1]/usr")
+                for i in range(min(usr.Children.Count, 30)):
+                    try:
+                        child = usr.Children(i)
+                        t = getattr(child, "Text", "") or ""
+                        if t:
+                            debug_texts.append(t)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            full_text = " ".join([title] + debug_texts)
+            m = re.search(r"\b(\d{8,10})\b", full_text)
+            if m:
+                doc_num = m.group(1)
+        except Exception:
+            pass
+        try:
+            session.findById("wnd[1]/tbar[0]/btn[0]").press()
+            time.sleep(1.0)
+        except Exception:
+            time.sleep(0.5)
+        if doc_num:
+            return doc_num, None
+        sbar = ""
+        try:
+            sbar = session.findById("wnd[0]/sbar").Text or ""
+        except Exception:
+            pass
+        m2 = re.search(r"\b(\d{8,10})\b", sbar)
+        if m2:
+            return m2.group(1), None
+        debug = " | ".join(debug_texts)
+        return None, f"Retry: {sbar or debug or 'no SAP response'}"
+    except Exception as exc:
+        return None, str(exc)
+
+
+def _run_clearing_task(task_id, key, data):
+    """Background thread: runs F-03 clearing and sends progress to the task queue."""
+    import pythoncom
+    pythoncom.CoInitialize()
+    try:
+        _do_clearing(task_id, key, data)
+    finally:
+        pythoncom.CoUninitialize()
+
+
+def _do_clearing(task_id, key, data):
+    q = _clear_tasks[task_id]["q"]
+    clearing_date = data.get("clearing_date", "")
+    accounts = data.get("accounts", [])
+
+    system_label = {"us": "United States (ISP)", "canada": "Canada (ISP)", "concur": "Concur (I4P)"}.get(key, key)
+    q.put(f"System: {system_label} -- {len(accounts)} account(s) -- date: {clearing_date}")
+
+    try:
+        import win32com.client
+        system_prefix = "I4P" if key == "concur" else "ISP"
+        sap_gui_auto = win32com.client.GetObject("SAPGUI")
+        sap_app = sap_gui_auto.GetScriptingEngine
+        session = None
+        for i in range(sap_app.Children.Count):
+            conn = sap_app.Children(i)
+            if conn.Children.Count > 0:
+                if conn.Children(0).PassportSystemid[:3] == system_prefix:
+                    session = conn.Children(0)
+                    break
+        if session is None:
+            q.put(f"ERROR: No {system_prefix} session found in SAP GUI")
+            q.put("__DONE_CLEAR__:ERROR")
+            return
+    except Exception as exc:
+        q.put(f"ERROR connecting SAP GUI: {exc}")
+        q.put("__DONE_CLEAR__:ERROR")
+        return
+
+    results = []
+    ok_count = 0
+
+    for acc_data in accounts:
+        account = str(acc_data.get("account", ""))
+        cc      = str(acc_data.get("cc", ""))
+        docs    = [str(d) for d in acc_data.get("documents", [])]
+
+        q.put(f"-> Clearing {account} / {cc}  ({len(docs)} documents)...")
+        clearing_doc, error = do_clear_account(session, account, cc, docs, clearing_date, system=system_prefix)
+
+        if error and error.startswith("__PAUSE_NEEDED__:"):
+            sap_msg = error[len("__PAUSE_NEEDED__:"):]
+            q.put(f"WARNING SAP rejected posting for {account}/{cc}: {sap_msg}")
+            q.put(f"__PAUSE__:{sap_msg}")
+            pause_evt = threading.Event()
+            _clear_pause_events[task_id] = pause_evt
+            resumed = pause_evt.wait(timeout=300)
+            _clear_pause_events.pop(task_id, None)
+            if resumed:
+                q.put(f"-> Retrying posting {account} / {cc}...")
+                clearing_doc, error = _retry_post(session, system=system_prefix)
+            else:
+                error = "Timeout: manual intervention not received (5 min)"
+
+        result = {
+            "account":      account,
+            "cc":           cc,
+            "clearing_doc": clearing_doc or "",
+            "status":       "ok" if clearing_doc else "error",
+            "error":        error or "",
+        }
+        results.append(result)
+
+        if clearing_doc:
+            ok_count += 1
+            q.put(f"OK {account} / {cc}  ->  Clearing doc: {clearing_doc}")
+        else:
+            q.put(f"ERROR {account} / {cc}  ->  {error}")
+
+    _clearing_results[key] = results
+
+    try:
+        ts    = datetime.now().strftime("%Y%m%d_%H%M%S")
+        fname = f"Clearing_Results_{key.upper()}_{ts}.xlsx"
+        fpath = os.path.join(SCRIPT_DIR, fname)
+        wb_out = openpyxl.Workbook()
+        ws_out = wb_out.active
+        ws_out.title = "Clearing Results"
+        ws_out.append(["G/L Account", "Company Code", "Clearing Document",
+                        "Status", "Error", "Clearing Date"])
+        for r in results:
+            ws_out.append([r["account"], r["cc"], r["clearing_doc"],
+                           r["status"], r["error"], clearing_date])
+        wb_out.save(fpath)
+        q.put(f"Excel saved: {fname}")
+    except Exception as exc:
+        q.put(f"Error saving Excel: {exc}")
+
+    q.put(f"Completed: {ok_count}/{len(accounts)} accounts cleared")
+    q.put(f"__DONE_CLEAR__:{'OK' if ok_count > 0 else 'ERROR'}")
+
 
 HTML = """<!DOCTYPE html>
 <html lang="en">
@@ -150,6 +527,25 @@ HTML = """<!DOCTYPE html>
   .chart-card-title{font-size:.78rem;font-weight:700;color:var(--text);margin-bottom:12px;display:flex;align-items:center;gap:8px;}
   .chart-card-title .ct-sub{font-weight:400;color:var(--sub);font-size:.72rem;}
   .chart-wrap{position:relative;}
+
+  /* ── Clearing modal ─────────────────────────────────────────── */
+  .modal-ov{position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:300;align-items:center;justify-content:center;}
+  .modal-box{background:#fff;border-radius:8px;width:390px;box-shadow:0 8px 32px rgba(0,0,0,.22);overflow:hidden;}
+  .modal-hdr{background:var(--shell);color:#fff;padding:14px 20px;display:flex;align-items:center;justify-content:space-between;font-size:.92rem;font-weight:700;}
+  .modal-x{background:none;border:none;color:#fff;cursor:pointer;font-size:1rem;opacity:.7;font-family:var(--font);line-height:1;padding:0;}
+  .modal-x:hover{opacity:1;}
+  .modal-body{padding:18px 20px 10px;}
+  .modal-lbl{display:block;font-size:.72rem;font-weight:700;color:var(--sub);text-transform:uppercase;letter-spacing:.7px;margin-bottom:6px;}
+  .modal-body input[type=date]{width:100%;padding:8px 12px;border:1px solid var(--border);border-radius:4px;font-size:.9rem;font-family:var(--font);color:var(--text);}
+  .modal-log{margin:8px 20px;background:#0D1520;border-radius:6px;padding:10px 12px;height:108px;overflow-y:auto;font-family:'Cascadia Code',Consolas,monospace;font-size:.71rem;color:#90A4AE;white-space:pre-wrap;display:none;}
+  .modal-log.on{display:block;}
+  .modal-foot{padding:12px 20px;border-top:1px solid var(--border);display:flex;justify-content:flex-end;gap:8px;}
+  .clear-btn{padding:3px 10px;border:1px solid var(--blue);border-radius:100px;background:#fff;color:var(--blue);font-size:.71rem;font-weight:600;cursor:pointer;font-family:var(--font);transition:all .1s;vertical-align:middle;}
+  .clear-btn:not(:disabled):hover{background:var(--blue);color:#fff;}
+  .clear-btn:disabled{opacity:.38;cursor:not-allowed;}
+  .cdoc{display:inline-block;font-size:.7rem;font-weight:600;margin-left:6px;padding:2px 8px;border-radius:100px;vertical-align:middle;}
+  .cdoc-ok{color:var(--ok);background:#EDFBEE;}
+  .cdoc-err{color:var(--err);background:#FFF0F0;}
 </style>
 </head>
 <body>
@@ -180,6 +576,7 @@ HTML = """<!DOCTYPE html>
         <div class="card-actions">
           <button class="btn" onclick="run('us',this)">▶ Run</button>
           <button class="btn-ghost" onclick="loadResults('us')">↻ Load Results</button>
+          <a class="btn-ghost" href="/download-open-items/us">⬇ Open Items</a>
           <span id="status-us" class="status idle"><span class="dot"></span>Idle</span>
         </div>
         <button class="log-toggle" onclick="toggleLog('us',this)" style="display:none" id="logtgl-us">Show output ▾</button>
@@ -196,6 +593,7 @@ HTML = """<!DOCTYPE html>
         <div class="card-actions">
           <button class="btn" onclick="run('canada',this)">▶ Run</button>
           <button class="btn-ghost" onclick="loadResults('canada')">↻ Load Results</button>
+          <a class="btn-ghost" href="/download-open-items/canada">⬇ Open Items</a>
           <span id="status-canada" class="status idle"><span class="dot"></span>Idle</span>
         </div>
         <button class="log-toggle" onclick="toggleLog('canada',this)" style="display:none" id="logtgl-canada">Show output ▾</button>
@@ -212,6 +610,7 @@ HTML = """<!DOCTYPE html>
         <div class="card-actions">
           <button class="btn" onclick="run('concur',this)">▶ Run</button>
           <button class="btn-ghost" onclick="loadResults('concur')">↻ Load Results</button>
+          <a class="btn-ghost" href="/download-open-items/concur">⬇ Open Items</a>
           <span id="status-concur" class="status idle"><span class="dot"></span>Idle</span>
         </div>
         <button class="log-toggle" onclick="toggleLog('concur',this)" style="display:none" id="logtgl-concur">Show output ▾</button>
@@ -290,6 +689,7 @@ HTML = """<!DOCTYPE html>
         <span class="flag">🇺🇸</span>
         <h3>United States</h3>
         <span id="badge-us" class="panel-badge"></span>
+        <button id="clearall-us" class="clear-btn" style="display:none;margin-left:auto" onclick="startClearAll('us')">&#9889; Clear All</button>
       </div>
       <div class="tbl-scroll">
         <table class="rtbl">
@@ -304,6 +704,7 @@ HTML = """<!DOCTYPE html>
         <span class="flag">🇨🇦</span>
         <h3>Canada</h3>
         <span id="badge-canada" class="panel-badge"></span>
+        <button id="clearall-canada" class="clear-btn" style="display:none;margin-left:auto" onclick="startClearAll('canada')">&#9889; Clear All</button>
       </div>
       <div class="tbl-scroll">
         <table class="rtbl">
@@ -318,6 +719,7 @@ HTML = """<!DOCTYPE html>
         <span class="flag">📋</span>
         <h3>Concur</h3>
         <span id="badge-concur" class="panel-badge"></span>
+        <button id="clearall-concur" class="clear-btn" style="display:none;margin-left:auto" onclick="startClearAll('concur')">&#9889; Clear All</button>
       </div>
       <div class="tbl-scroll">
         <table class="rtbl">
@@ -330,8 +732,33 @@ HTML = """<!DOCTYPE html>
   </div>
 </div>
 
+
+<!-- Clearing date modal -->
+<div id="clear-modal" class="modal-ov" style="display:none">
+  <div class="modal-box">
+    <div class="modal-hdr">
+      <span>&#9889; Clear Accounts</span>
+      <button class="modal-x" onclick="_closeModal()">&#10005;</button>
+    </div>
+    <div class="modal-body">
+      <label class="modal-lbl">Clearing Date</label>
+      <input type="date" id="clear-date-inp">
+    </div>
+    <div id="clear-modal-log" class="modal-log"></div>
+    <div class="modal-foot">
+      <button class="btn-ghost" id="clear-cancel-btn" onclick="_closeModal()">Cancel</button>
+      <button class="btn" id="clear-resume-btn" style="display:none;background:#E9730C;border-color:#C45800;" onclick="resumeClear()">&#9654; Continue</button>
+      <button class="btn" id="clear-ok-btn" onclick="confirmClear()">&#9889; Proceed</button>
+    </div>
+  </div>
+</div>
+
 <script>
 function fmt(n){return Number(n).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});}
+
+const _rdata={};
+let _pend=null;
+let _currentTaskId=null;
 
 function toggleLog(key,btn){
   const w=document.getElementById('log-'+key);
@@ -473,6 +900,14 @@ function switchAnalytics(key,btn){
   btn.classList.add('active');
   if(analyticsCache[key]) renderAnalytics(key);
   else fetchAnalytics(key).then(ok=>{if(ok) renderAnalytics(key);});
+  if(_rdata[key]){
+    ['us','canada','concur'].forEach(k=>{
+      document.getElementById('panel-'+k).classList.toggle('visible', k===key);
+    });
+    document.getElementById('results-section').classList.add('visible');
+  } else {
+    loadResults(key);
+  }
 }
 
 function renderAnalytics(key){
@@ -575,6 +1010,155 @@ function buildPeriodChart(byPeriod){
       }
     }
   });
+}
+
+
+// ── Clearing ──────────────────────────────────────────────────────────
+function startClearAll(key){
+  const data=_rdata[key];
+  if(!data||!data.length)return;
+  _pend={key,accounts:data.map(g=>({account:g.account,cc:g.cc,documents:dedupDocs(g.documents)}))};
+  _openModal();
+}
+
+function startClearSingleBtn(btn){
+  startClearSingle(btn.dataset.key,btn.dataset.acc,btn.dataset.cc);
+}
+
+function startClearSingle(key,account,cc){
+  const data=_rdata[key]; if(!data)return;
+  const grp=data.find(g=>g.account===account&&g.cc===cc); if(!grp)return;
+  _pend={key,accounts:[{account,cc,documents:dedupDocs(grp.documents)}]};
+  _openModal();
+}
+
+function dedupDocs(docs){
+  const seen=new Set();
+  const out=[];
+  for(const d of docs){if(!seen.has(d.doc)){seen.add(d.doc);out.push(d.doc);}}
+  return out;
+}
+
+function _openModal(){
+  const labels={us:'&#127482;&#127480; United States (ISP)',canada:'&#127464;&#127462; Canada (ISP)',concur:'&#128203; Concur (I4P)'};
+  const m=document.getElementById('clear-modal');
+  const n=(_pend&&_pend.accounts)?_pend.accounts.length:0;
+  m.querySelector('.modal-hdr span').textContent=
+    'Clear -- '+(labels[_pend&&_pend.key]||(_pend&&_pend.key)||'?')+
+    ' - '+n+' account'+(n!==1?'s':'');
+  m.style.display='flex';
+  document.getElementById('clear-date-inp').value=new Date().toISOString().slice(0,10);
+  const log=document.getElementById('clear-modal-log');
+  log.innerHTML=''; log.classList.remove('on');
+  document.getElementById('clear-ok-btn').disabled=false;
+  document.getElementById('clear-cancel-btn').disabled=false;
+  document.getElementById('clear-resume-btn').style.display='none';
+}
+
+function _closeModal(){
+  document.getElementById('clear-modal').style.display='none';
+  _pend=null;
+}
+
+function confirmClear(){
+  if(!_pend)return;
+  const raw=document.getElementById('clear-date-inp').value;
+  if(!raw){alert('Select a clearing date.');return;}
+  const [yy,mm,dd]=raw.split('-');
+  const sapDate=mm+'/'+dd+'/'+yy;
+  document.getElementById('clear-ok-btn').disabled=true;
+  document.getElementById('clear-cancel-btn').disabled=true;
+  const log=document.getElementById('clear-modal-log');
+  log.innerHTML=''; log.classList.add('on');
+  const key=_pend.key;
+
+  fetch('/clear/'+key,{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({clearing_date:sapDate,accounts:_pend.accounts})
+  }).then(r=>r.json()).then(({task_id})=>{
+    if(!task_id)throw new Error('No task_id returned');
+    _currentTaskId=task_id;
+    const es=new EventSource('/clear-stream/'+task_id);
+    es.onmessage=function(e){
+      const msg=e.data;
+      if(msg.startsWith('__PAUSE__:')){
+        const sapMsg=msg.slice(10);
+        document.getElementById('clear-resume-btn').style.display='';
+        document.getElementById('clear-cancel-btn').disabled=false;
+        const d1=document.createElement('div');
+        d1.textContent='WARNING SAP rejected: '+sapMsg;
+        d1.style.color='#EF5350';
+        log.appendChild(d1);
+        const d2=document.createElement('div');
+        d2.textContent='Double-click the amount in SAP, then press Continue';
+        d2.style.color='#FFB74D';
+        log.appendChild(d2);
+        log.scrollTop=log.scrollHeight;
+        return;
+      }
+      if(msg.startsWith('__DONE_CLEAR__')){
+        es.close();
+        _currentTaskId=null;
+        document.getElementById('clear-resume-btn').style.display='none';
+        document.getElementById('clear-cancel-btn').disabled=false;
+        fetch('/clearing-results/'+key).then(r=>r.json()).then(results=>{
+          results.forEach(r=>{
+            const docEl=document.getElementById('cdoc-'+r.account+'-'+r.cc);
+            const btnEl=document.getElementById('cbtn-'+r.account+'-'+r.cc);
+            if(docEl){
+              docEl.style.display='';
+              if(r.status==='ok'){docEl.textContent='Doc: '+r.clearing_doc;docEl.className='cdoc cdoc-ok';}
+              else{docEl.textContent='Error';docEl.title=r.error;docEl.className='cdoc cdoc-err';}
+            }
+            if(btnEl)btnEl.disabled=true;
+          });
+          const cab=document.getElementById('clearall-'+key);
+          if(cab)cab.disabled=true;
+        });
+        const isOk=msg.includes(':OK');
+        const fin=document.createElement('div');
+        fin.textContent=isOk?'Completed':'Finished with errors';
+        fin.style.color=isOk?'#66BB6A':'#EF5350';
+        fin.style.fontWeight='700';
+        log.appendChild(fin); log.scrollTop=log.scrollHeight;
+        if(isOk)setTimeout(_closeModal,2500);
+        return;
+      }
+      document.getElementById('clear-resume-btn').style.display='none';
+      const div=document.createElement('div');
+      const l=msg.toLowerCase();
+      if(l.includes('ok ')||l.includes('saved')||l.includes('completed'))div.style.color='#66BB6A';
+      else if(l.includes('error')||l.includes('warning'))div.style.color='#EF5350';
+      else if(l.includes('retry')||l.includes('->'))div.style.color='#42A5F5';
+      div.textContent=msg; log.appendChild(div); log.scrollTop=log.scrollHeight;
+    };
+    es.onerror=function(){
+      es.close();
+      _currentTaskId=null;
+      document.getElementById('clear-resume-btn').style.display='none';
+      document.getElementById('clear-cancel-btn').disabled=false;
+      document.getElementById('clear-ok-btn').disabled=false;
+    };
+  }).catch(err=>{
+    document.getElementById('clear-ok-btn').disabled=false;
+    document.getElementById('clear-cancel-btn').disabled=false;
+    const div=document.createElement('div');
+    div.textContent='Error: '+err; div.style.color='#EF5350';
+    log.appendChild(div); log.classList.add('on');
+  });
+}
+
+function resumeClear(){
+  if(!_currentTaskId)return;
+  document.getElementById('clear-resume-btn').style.display='none';
+  document.getElementById('clear-cancel-btn').disabled=true;
+  const div=document.createElement('div');
+  div.textContent='Resuming clearing...';
+  div.style.color='#42A5F5';
+  document.getElementById('clear-modal-log').appendChild(div);
+  document.getElementById('clear-modal-log').scrollTop=999999;
+  fetch('/clear-resume/'+_currentTaskId,{method:'POST'});
 }
 
 // Auto-load on page load if pivot files exist
@@ -760,6 +1344,133 @@ def get_summary(key):
             "docs_by_account":      docs_by_acc,
             "docs_by_period":       docs_by_period,
         })
+    except Exception as e:
+        import traceback
+        return jsonify({"error": str(e), "detail": traceback.format_exc()}), 500
+
+
+@app.route("/clear/<key>", methods=["POST"])
+def clear_start(key):
+    if key not in SCRIPTS:
+        return jsonify({"error": "not found"}), 404
+    data = request.json or {}
+    task_id = f"{key}_{int(time.time() * 1000)}"
+    _clear_tasks[task_id] = {"key": key, "q": queue.Queue()}
+    t = threading.Thread(target=_run_clearing_task, args=(task_id, key, data), daemon=True)
+    t.start()
+    return jsonify({"task_id": task_id})
+
+
+@app.route("/clear-stream/<task_id>")
+def clear_stream(task_id):
+    if task_id not in _clear_tasks:
+        return "Task not found", 404
+    q_ref = _clear_tasks[task_id]["q"]
+
+    def generate():
+        while True:
+            try:
+                msg = q_ref.get(timeout=300)
+                yield f"data: {msg}\n\n"
+                if msg.startswith("__DONE_CLEAR__"):
+                    break
+            except queue.Empty:
+                yield "data: ERROR: Timeout waiting for SAP\n\n"
+                yield "data: __DONE_CLEAR__:ERROR\n\n"
+                break
+
+    return Response(
+        generate(),
+        mimetype="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.route("/clearing-results/<key>")
+def get_clearing_results_api(key):
+    return jsonify(_clearing_results.get(key, []))
+
+
+@app.route("/clear-resume/<task_id>", methods=["POST"])
+def clear_resume(task_id):
+    if task_id in _clear_pause_events:
+        _clear_pause_events[task_id].set()
+        return jsonify({"ok": True})
+    return jsonify({"error": "task not paused"}), 404
+
+
+@app.route("/download-open-items/<key>")
+def download_open_items(key):
+    if key not in INPUT_FILES:
+        return jsonify({"error": "not found"}), 404
+    input_path = os.path.join(SCRIPT_DIR, INPUT_FILES[key])
+    pivot_path = os.path.join(SCRIPT_DIR, OUTPUT_FILES[key])
+    if not os.path.exists(input_path):
+        return jsonify({"error": "Input file not found. Run the script first."}), 404
+    try:
+        if key == "concur":
+            sheet_name = "Data"
+        elif key == "canada":
+            with pd.ExcelFile(input_path) as xl:
+                sheet_name = "Data" if "Data" in xl.sheet_names else xl.sheet_names[0]
+        else:
+            sheet_name = None
+
+        df = pd.read_excel(input_path, sheet_name=sheet_name, header=5)
+
+        if key == "concur" and "Clearing Document" in df.columns:
+            df = df[df["Clearing Document"].isna()]
+        if "Year/Month" in df.columns:
+            df = df[df["Year/Month"] >= "2024/01"]
+
+        clearable_docs = set()
+        if os.path.exists(pivot_path):
+            try:
+                with pd.ExcelFile(pivot_path) as xl2:
+                    docs_df = pd.read_excel(xl2, sheet_name="Docs a Clearear")
+                clearable_docs = set(
+                    str(int(float(d))) for d in docs_df["Document Number"].dropna()
+                )
+            except Exception:
+                pass
+
+        doc_col = next((c for c in df.columns if "document" in c.lower() and "number" in c.lower()), None)
+        if clearable_docs and doc_col:
+            def _docstr(v):
+                try:
+                    return str(int(float(v)))
+                except Exception:
+                    return str(v)
+            df = df[~df[doc_col].apply(_docstr).isin(clearable_docs)]
+
+        wb = openpyxl.load_workbook(input_path)
+        ws = wb[sheet_name] if sheet_name else wb.active
+        if ws.max_row >= 7:
+            ws.delete_rows(7, ws.max_row - 6)
+        header_cols = [c.value for c in ws[6]]
+        for _, row in df.iterrows():
+            row_values = []
+            for col_name in header_cols:
+                if col_name is None:
+                    row_values.append(None)
+                    continue
+                val = row.get(col_name)
+                try:
+                    row_values.append(None if pd.isna(val) else val)
+                except Exception:
+                    row_values.append(val)
+            ws.append(row_values)
+
+        buf = io.BytesIO()
+        wb.save(buf)
+        buf.seek(0)
+        filename = f"Open_Items_{key.upper()}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        return send_file(
+            buf,
+            as_attachment=True,
+            download_name=filename,
+            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
     except Exception as e:
         import traceback
         return jsonify({"error": str(e), "detail": traceback.format_exc()}), 500
